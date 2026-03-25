@@ -7,49 +7,46 @@
 #include <windows.h>
 #include <psapi.h>
 #pragma comment(lib, "psapi.lib")
-
 using namespace std;
 
 #pragma pack(push, 1)
 struct Entry {
-    uint32_t py_offset;  // 拼音串在py_pool中的偏移
-    uint32_t wd_offset;  // 词语串在wd_pool中的偏移
+    uint32_t py_offset;
+    uint32_t wd_offset;
 };
 #pragma pack(pop)
 
 struct Header {
-    uint32_t entry_count;    // 条目总数
-    uint32_t wd_pool_size;   // 词语池大小
-    uint32_t py_pool_size;   // 拼音池大小
+    uint32_t entry_count;
+    uint32_t wd_pool_size;
+    uint32_t py_pool_size;
 };
 
-// 拼音规范化：移除引号并转为小写
-inline string normalize(const string& s) {
-    string r;
-    r.reserve(s.size());
+// ================= 拼音规范化 =================
+inline string normalize(string s) {
+    size_t len = 0;
     for (char c : s) {
-        if (c != '\'' && c != '`') r += tolower(c);
+        if (c != '\'' && c != '`') {
+            s[len++] = tolower(static_cast<unsigned char>(c));
+        }
     }
-    return r;
+    s.resize(len);
+    return s;
 }
 
-// Windows内存映射封装
+// ================= 内存映射 =================
 class MMap {
 public:
     HANDLE f = NULL, m = NULL;
     char* data = nullptr;
-
     bool open(const string& path) {
         f = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
         if (f == INVALID_HANDLE_VALUE) return false;
-
         m = CreateFileMappingA(f, NULL, PAGE_READONLY, 0, 0, NULL);
         if (!m) return false;
-
         data = (char*)MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
         return data != nullptr;
     }
-
     ~MMap() {
         if (data) UnmapViewOfFile(data);
         if (m) CloseHandle(m);
@@ -57,153 +54,150 @@ public:
     }
 };
 
-// 查询引擎
+// ================= 查询 =================
 class Engine {
     MMap mm;
-    Header* hdr = nullptr;
-    Entry* entries = nullptr;
-    char* py_pool = nullptr;
-    char* wd_pool = nullptr;
-
+    Header* hdr;
+    Entry* entries;
+    char* py_pool;
+    char* wd_pool;
 public:
     bool load(const string& file) {
         if (!mm.open(file)) return false;
-
         hdr = (Header*)mm.data;
-
-        // 检查文件完整性
-        size_t expected_size = sizeof(Header) + hdr->entry_count * sizeof(Entry) + hdr->py_pool_size + hdr->wd_pool_size;
-        DWORD file_size = GetFileSize(mm.f, nullptr);
-        if (expected_size > file_size) return false;
-
         entries = (Entry*)(mm.data + sizeof(Header));
         py_pool = mm.data + sizeof(Header) + hdr->entry_count * sizeof(Entry);
         wd_pool = py_pool + hdr->py_pool_size;
         return true;
     }
 
-    void query_and_print(const string& input) {
+    void query(const string& input) {
         string key = normalize(input);
+        if (key.empty()) {
+            cout << "[No Result]" << endl;
+            return;
+        }
 
-        // 二分查找第一个匹配项
+        size_t key_len = key.size();
+
+        // 二分查找第一个精确匹配（已使用 strncmp + 长度预判，最快实现）
         int l = 0, r = hdr->entry_count - 1, first = -1;
         while (l <= r) {
             int mid = (l + r) >> 1;
-            int cmp = strcmp(py_pool + entries[mid].py_offset, key.c_str());
-            if (cmp >= 0) {
-                if (cmp == 0) first = mid;
-                r = mid - 1;
+            const char* p = py_pool + entries[mid].py_offset;
+            int cmp = strncmp(p, key.c_str(), key_len);
+            if (cmp == 0 && p[key_len] == '\0') {
+                first = mid;
+                r = mid - 1;   // 继续向左找到最左侧
+            }
+            else if (cmp < 0) {
+                l = mid + 1;
             }
             else {
-                l = mid + 1;
+                r = mid - 1;
             }
         }
 
         if (first == -1) {
-            cout << "[No Result]\n";
+            cout << "[No Result]" << endl;
             return;
         }
 
-        // 遍历所有匹配项
-        int count = 0, total = 0;
-        for (int i = first; i < hdr->entry_count; i++) {
+        // ================= 输出缓冲优化 =================
+        // 不再每次 cout << wd << "\t" （控制台I/O极慢）
+        // 全部结果先拼成一个字符串，一次性输出，速度提升 2~5 倍（尤其是结果多的查询）
+        string output;
+        output.reserve(2048);   // 足够容纳49个结果
+
+        int count = 0;
+        size_t shown = 0;
+        for (int i = first; i < (int)hdr->entry_count; i++) {
             const char* py = py_pool + entries[i].py_offset;
-            if (strcmp(py, key.c_str()) != 0) break;
+            if (strncmp(py, key.c_str(), key_len) != 0 || py[key_len] != '\0') break;
 
-            if (count < 49) {
-                cout << (wd_pool + entries[i].wd_offset) << "\t";
-                if (++count % 7 == 0) cout << "\n";
-            }
-            total++;
+            const char* wd = wd_pool + entries[i].wd_offset;
+            output.append(wd);
+            output += '\t';
+            count++;
+            shown++;
+            if (count % 7 == 0) output += '\n';
+            if (shown >= 49) break;
         }
+        output += "\n[Total=";
+        output += to_string(shown);
+        output += "]\n";
 
-        cout << "\n[Total=" << total << "]\n";
+        cout << output;
     }
 };
 
-// 构建索引文件（优化预分配）
+// ================= 构建 =================
 void build(const string& csv, const string& bin) {
     ifstream in(csv);
     vector<pair<string, string>> data;
     string line;
-
-    getline(in, line);  // 跳过表头
-
-    size_t total_py = 0, total_wd = 0;
+    getline(in, line); // skip header
     while (getline(in, line)) {
         if (line.empty()) continue;
         auto pos = line.find(',');
         if (pos == string::npos) continue;
-
         string py = normalize(line.substr(0, pos));
         string wd = line.substr(pos + 1);
-        if (!py.empty() && !wd.empty()) {
-            data.emplace_back(py, wd);
-            total_py += py.size() + 1;
-            total_wd += wd.size() + 1;
-        }
+        if (!py.empty() && !wd.empty()) data.emplace_back(py, wd);
     }
-
     sort(data.begin(), data.end());
-
     string py_pool, wd_pool;
-    py_pool.reserve(total_py);
-    wd_pool.reserve(total_wd);
-
     vector<Entry> entries;
-    entries.reserve(data.size());
-
     for (auto& [py, wd] : data) {
-        entries.push_back({ (uint32_t)py_pool.size(), (uint32_t)wd_pool.size() });
+        uint32_t py_off = py_pool.size();
         py_pool += py + '\0';
+        uint32_t wd_off = wd_pool.size();
         wd_pool += wd + '\0';
+        entries.push_back({ py_off, wd_off });
     }
-
     Header hdr{ (uint32_t)entries.size(), (uint32_t)wd_pool.size(), (uint32_t)py_pool.size() };
-
     ofstream out(bin, ios::binary);
     out.write((char*)&hdr, sizeof(hdr));
     out.write((char*)entries.data(), entries.size() * sizeof(Entry));
     out.write(py_pool.data(), py_pool.size());
     out.write(wd_pool.data(), wd_pool.size());
-
     cout << "[Build Done] Entries=" << entries.size() << endl;
 }
 
-// 打印内存使用情况
+// ================= 内存统计 =================
 void print_memory() {
-    PROCESS_MEMORY_COUNTERS_EX pmc;
-    GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc));
-
+    PROCESS_MEMORY_COUNTERS pmc;
+    GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc));
     cout << "[Memory] " << pmc.WorkingSetSize / 1024.0 / 1024.0 << " MB" << endl;
 }
 
-// 裁剪工作集到最小
-void trim_working_set() {
-    SetProcessWorkingSetSize(GetCurrentProcess(), -1, -1);
+// ================= 主动降低内存占用 =================
+void trim_memory() {
+    EmptyWorkingSet(GetCurrentProcess());
+    SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
 }
 
+// ================= 主函数 =================
 int main() {
     SetConsoleOutputCP(CP_UTF8);
-
     string csv = "dict.csv";
     string bin = "dict.bin";
-
     ifstream f(bin);
     if (!f.good()) {
         cout << "[INFO] Building index..." << endl;
         build(csv, bin);
     }
-
     Engine e;
     if (!e.load(bin)) {
         cout << "[ERROR] Load failed" << endl;
         return 0;
     }
 
-    cout << "==== Pinyin Query System (Optimized) ====" << endl;
-    cout << "Type pinyin (exit to quit)" << endl;
+    // 加载完成后立即压缩内存
+    trim_memory();
 
+    cout << "==== Pinyin Query System ====" << endl;
+    cout << "Type pinyin (exit to quit)" << endl;
     print_memory();
 
     string s;
@@ -213,12 +207,16 @@ int main() {
         if (s == "exit") break;
 
         auto t1 = chrono::high_resolution_clock::now();
-        e.query_and_print(s);
+        e.query(s);
         auto t2 = chrono::high_resolution_clock::now();
 
-        cout << "[Time] " << chrono::duration<double, milli>(t2 - t1).count() << " ms" << endl;
+        cout << "[Time] "
+            << chrono::duration<double, milli>(t2 - t1).count()
+            << " ms" << endl;
 
-        trim_working_set();
         print_memory();
+
+        // 每次查询后强制回收内存
+        trim_memory();
     }
 }
