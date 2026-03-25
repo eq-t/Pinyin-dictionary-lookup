@@ -12,18 +12,18 @@ using namespace std;
 
 #pragma pack(push, 1)
 struct Entry {
-    uint32_t py_offset;
-    uint32_t wd_offset;
+    uint32_t py_offset;  // 拼音串在py_pool中的偏移
+    uint32_t wd_offset;  // 词语串在wd_pool中的偏移
 };
 #pragma pack(pop)
 
 struct Header {
-    uint32_t entry_count;
-    uint32_t wd_pool_size;
-    uint32_t py_pool_size;
+    uint32_t entry_count;    // 条目总数
+    uint32_t wd_pool_size;   // 词语池大小
+    uint32_t py_pool_size;   // 拼音池大小
 };
 
-// ================= 拼音规范化 =================
+// 拼音规范化：移除引号并转为小写
 inline string normalize(const string& s) {
     string r;
     r.reserve(s.size());
@@ -33,7 +33,7 @@ inline string normalize(const string& s) {
     return r;
 }
 
-// ================= 内存映射 =================
+// Windows内存映射封装
 class MMap {
 public:
     HANDLE f = NULL, m = NULL;
@@ -57,29 +57,35 @@ public:
     }
 };
 
-// ================= 查询 =================
+// 查询引擎
 class Engine {
     MMap mm;
-    Header* hdr;
-    Entry* entries;
-    char* py_pool;
-    char* wd_pool;
+    Header* hdr = nullptr;
+    Entry* entries = nullptr;
+    char* py_pool = nullptr;
+    char* wd_pool = nullptr;
 
 public:
     bool load(const string& file) {
         if (!mm.open(file)) return false;
 
         hdr = (Header*)mm.data;
+
+        // 检查文件完整性
+        size_t expected_size = sizeof(Header) + hdr->entry_count * sizeof(Entry) + hdr->py_pool_size + hdr->wd_pool_size;
+        DWORD file_size = GetFileSize(mm.f, nullptr);
+        if (expected_size > file_size) return false;
+
         entries = (Entry*)(mm.data + sizeof(Header));
         py_pool = mm.data + sizeof(Header) + hdr->entry_count * sizeof(Entry);
         wd_pool = py_pool + hdr->py_pool_size;
         return true;
     }
 
-    vector<string> query(const string& input) {
-        vector<string> res;
+    void query_and_print(const string& input) {
         string key = normalize(input);
 
+        // 二分查找第一个匹配项
         int l = 0, r = hdr->entry_count - 1, first = -1;
         while (l <= r) {
             int mid = (l + r) >> 1;
@@ -88,28 +94,42 @@ public:
                 if (cmp == 0) first = mid;
                 r = mid - 1;
             }
-            else l = mid + 1;
+            else {
+                l = mid + 1;
+            }
         }
 
-        if (first == -1) return res;
+        if (first == -1) {
+            cout << "[No Result]\n";
+            return;
+        }
 
+        // 遍历所有匹配项
+        int count = 0, total = 0;
         for (int i = first; i < hdr->entry_count; i++) {
             const char* py = py_pool + entries[i].py_offset;
             if (strcmp(py, key.c_str()) != 0) break;
-            res.emplace_back(wd_pool + entries[i].wd_offset);
+
+            if (count < 49) {
+                cout << (wd_pool + entries[i].wd_offset) << "\t";
+                if (++count % 7 == 0) cout << "\n";
+            }
+            total++;
         }
-        return res;
+
+        cout << "\n[Total=" << total << "]\n";
     }
 };
 
-// ================= 构建 =================
+// 构建索引文件（优化预分配）
 void build(const string& csv, const string& bin) {
     ifstream in(csv);
     vector<pair<string, string>> data;
     string line;
 
-    getline(in, line); // skip header
+    getline(in, line);  // 跳过表头
 
+    size_t total_py = 0, total_wd = 0;
     while (getline(in, line)) {
         if (line.empty()) continue;
         auto pos = line.find(',');
@@ -117,22 +137,26 @@ void build(const string& csv, const string& bin) {
 
         string py = normalize(line.substr(0, pos));
         string wd = line.substr(pos + 1);
-        if (!py.empty() && !wd.empty()) data.emplace_back(py, wd);
+        if (!py.empty() && !wd.empty()) {
+            data.emplace_back(py, wd);
+            total_py += py.size() + 1;
+            total_wd += wd.size() + 1;
+        }
     }
 
     sort(data.begin(), data.end());
 
     string py_pool, wd_pool;
+    py_pool.reserve(total_py);
+    wd_pool.reserve(total_wd);
+
     vector<Entry> entries;
+    entries.reserve(data.size());
 
     for (auto& [py, wd] : data) {
-        uint32_t py_off = py_pool.size();
+        entries.push_back({ (uint32_t)py_pool.size(), (uint32_t)wd_pool.size() });
         py_pool += py + '\0';
-
-        uint32_t wd_off = wd_pool.size();
         wd_pool += wd + '\0';
-
-        entries.push_back({ py_off, wd_off });
     }
 
     Header hdr{ (uint32_t)entries.size(), (uint32_t)wd_pool.size(), (uint32_t)py_pool.size() };
@@ -146,14 +170,19 @@ void build(const string& csv, const string& bin) {
     cout << "[Build Done] Entries=" << entries.size() << endl;
 }
 
-// ================= 内存统计 =================
+// 打印内存使用情况
 void print_memory() {
-    PROCESS_MEMORY_COUNTERS pmc;
-    GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc));
+    PROCESS_MEMORY_COUNTERS_EX pmc;
+    GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc));
+
     cout << "[Memory] " << pmc.WorkingSetSize / 1024.0 / 1024.0 << " MB" << endl;
 }
 
-// ================= 主函数 =================
+// 裁剪工作集到最小
+void trim_working_set() {
+    SetProcessWorkingSetSize(GetCurrentProcess(), -1, -1);
+}
+
 int main() {
     SetConsoleOutputCP(CP_UTF8);
 
@@ -172,8 +201,9 @@ int main() {
         return 0;
     }
 
-    cout << "==== Pinyin Query System ====" << endl;
+    cout << "==== Pinyin Query System (Optimized) ====" << endl;
     cout << "Type pinyin (exit to quit)" << endl;
+
     print_memory();
 
     string s;
@@ -183,27 +213,12 @@ int main() {
         if (s == "exit") break;
 
         auto t1 = chrono::high_resolution_clock::now();
-        auto res = e.query(s);
+        e.query_and_print(s);
         auto t2 = chrono::high_resolution_clock::now();
 
-        if (res.empty()) {
-            cout << "[No Result]" << endl;
-        }
-        else {
-            int count = 0;
-            for (int i = 0; i < (int)res.size(); i++) {
-                cout << res[i] << "\t";
-                count++;
-                if (count % 7 == 0) cout << "\n";
-                if (i >= 48) break; // 最多显示49个
-            }
-            cout << "\n[Total=" << res.size() << "]" << endl;
-        }
+        cout << "[Time] " << chrono::duration<double, milli>(t2 - t1).count() << " ms" << endl;
 
-        cout << "[Time] "
-            << chrono::duration<double, milli>(t2 - t1).count()
-            << " ms" << endl;
-
+        trim_working_set();
         print_memory();
     }
 }
