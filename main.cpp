@@ -22,7 +22,7 @@ struct Header {
     uint32_t py_pool_size;
 };
 
-// ================= 拼音规范化 =================
+// ================= 拼音规范化（原地修改，速度最优） =================
 inline string normalize(string s) {
     size_t len = 0;
     for (char c : s) {
@@ -80,7 +80,7 @@ public:
 
         size_t key_len = key.size();
 
-        // 二分查找第一个精确匹配（已使用 strncmp + 长度预判，最快实现）
+        // 二分查找第一个精确匹配
         int l = 0, r = hdr->entry_count - 1, first = -1;
         while (l <= r) {
             int mid = (l + r) >> 1;
@@ -88,7 +88,7 @@ public:
             int cmp = strncmp(p, key.c_str(), key_len);
             if (cmp == 0 && p[key_len] == '\0') {
                 first = mid;
-                r = mid - 1;   // 继续向左找到最左侧
+                r = mid - 1;        // 继续向左找到最左侧
             }
             else if (cmp < 0) {
                 l = mid + 1;
@@ -103,31 +103,36 @@ public:
             return;
         }
 
-        // ================= 输出缓冲优化 =================
-        // 不再每次 cout << wd << "\t" （控制台I/O极慢）
-        // 全部结果先拼成一个字符串，一次性输出，速度提升 2~5 倍（尤其是结果多的查询）
+        // ================= 计算实际总数 + 输出缓冲 =================
+        size_t total = 0;           // 实际匹配到的全部数量
         string output;
-        output.reserve(2048);   // 足够容纳49个结果
+        output.reserve(2048);
 
-        int count = 0;
-        size_t shown = 0;
+        int count = 0;              // 用于换行计数
+        size_t shown = 0;           // 用于限制显示数量
+
         for (int i = first; i < (int)hdr->entry_count; i++) {
             const char* py = py_pool + entries[i].py_offset;
-            if (strncmp(py, key.c_str(), key_len) != 0 || py[key_len] != '\0') break;
+            if (strncmp(py, key.c_str(), key_len) != 0 || py[key_len] != '\0')
+                break;
 
-            const char* wd = wd_pool + entries[i].wd_offset;
-            output.append(wd);
-            output += '\t';
-            count++;
-            shown++;
-            if (count % 7 == 0) output += '\n';
-            if (shown >= 49) break;
+            total++;                // 统计实际总数（关键修复）
+
+            if (shown < 49) {       // 只显示前49个
+                const char* wd = wd_pool + entries[i].wd_offset;
+                output.append(wd);
+                output += '\t';
+                count++;
+                shown++;
+                if (count % 7 == 0) output += '\n';
+            }
         }
-        output += "\n[Total=";
-        output += to_string(shown);
-        output += "]\n";
 
+        // 输出结果
         cout << output;
+        if (shown % 7 != 0) cout << "\n";   // 如果最后一行没满7个，补换行
+
+        cout << "[Total=" << total << "]\n";   // 显示真实总数
     }
 };
 
